@@ -115,21 +115,34 @@ def wanted(cards, allow, block):
 def ensure_login(client, pages):
     """Block until the volunteer is really signed in, without disturbing the login page.
 
-    Two earlier versions were wrong. Calling logged_in() navigates to /me, which threw away
-    whatever the person was halfway through typing. Looking for the session cookie is
-    non-destructive but useless: RoyaleAPI sets __royaleapi_session_v2 for anonymous
-    visitors too, so it reported success before anyone had logged in.
+    Three approaches were needed to get this right, so the reasoning is worth keeping:
 
-    This asks /me through the context's request API. It shares the profile's cookies, so
-    the answer is authoritative, and it opens no page, so the login form is left alone.
+      * client.logged_in() navigates the visible page to /me, which threw away whatever the
+        person was halfway through typing.
+      * The session cookie is useless as a signal - RoyaleAPI sets __royaleapi_session_v2
+        for anonymous visitors, so it reported success before anyone had logged in.
+      * The context's request API is blocked by Cloudflare with a flat 403 whether logged in
+        or not, because it carries no browser fingerprint.
+
+    So the check opens a SECOND page, which has the real browser fingerprint and passes
+    Cloudflare, and closes it again. /me stays on /me when signed in and redirects to /login
+    when not. The page the volunteer is typing into is never touched.
     """
     def signed_in():
+        page = None
         try:
-            r = pages._ctx.request.get("https://royaleapi.com/me",
-                                       max_redirects=0, timeout=30_000)
-            return r.status == 200 and "/login" not in r.url
+            page = pages._ctx.new_page()
+            page.goto("https://royaleapi.com/me", wait_until="domcontentloaded",
+                      timeout=45_000)
+            return "/login" not in page.url
         except Exception:                                      # noqa: BLE001
             return False
+        finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:                              # noqa: BLE001
+                    pass
 
     if signed_in():
         return True
@@ -144,10 +157,10 @@ def ensure_login(client, pages):
           flush=True)
     waited = 0
     while waited < 3600:
-        time.sleep(5)
-        waited += 5
+        time.sleep(15)          # a real page load each time, so not too eagerly
+        waited += 15
         if signed_in():
-            print("  logged in, thanks.\n", flush=True)
+            print("  logged in, thanks. working.\n", flush=True)
             return True
         if waited % 60 == 0:
             print(f"  still waiting for login ({waited // 60} min)", flush=True)
