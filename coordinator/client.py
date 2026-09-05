@@ -220,29 +220,36 @@ def do_group(client, server, token, units, cfg, name):
     by_tag = {u["target"].lstrip("#"): u for u in units}
     players = {t: {"player_tag": t} for t in tags}
 
-    print(f"  crawling {len(tags)} players together: {', '.join(tags[:6])}"
-          f"{'...' if len(tags) > 6 else ''}", flush=True)
+    # One player at a time. The group crawl (n=8 above) overlaps the page walks and should
+    # be roughly three times faster, but it has never been measured end to end - the test IP
+    # tripped Cloudflare before a run completed. This path is the one that has actually
+    # collected battles, so it is what volunteers get until the faster one is proven.
+    print(f"  crawling: {', '.join(tags)}", flush=True)
 
-    # max_pages matters more than it looks. The default of 0 walks a player's ENTIRE
-    # archive, and battles() returns nothing until every player in the group is exhausted -
-    # so one deep-history player stalls the whole group for many minutes before a single
-    # replay is fetched. The original scraper caps at 40 pages for exactly this reason.
-    rows, _, _ = pipeline.battles(
+    # battles() walks every player one page per round, which is what makes it fast, but it
+    # only RETURNS once the whole group is exhausted - 8 players x 40 pages is ~23 minutes of
+    # silence before a single replay is fetched. on_done fires as each player finishes, so
+    # their replays are fetched then: same overlap, progress every minute or two instead.
+    sink = CoordinatorSink(server, token, name, {"rating": None})
+
+    def player_finished(tag, kept):
+        rows = [b for b in kept if b.get("replay_tag")]
+        if not rows:
+            return
+        tag_list = [b["replay_tag"] for b in rows]
+        known = set()
+        for i in range(0, len(tag_list), 2000):
+            known |= set(post(server, token, "/known",
+                              {"tags": tag_list[i:i + 2000], "worker": name})["known"])
+        todo = [b for b in rows if b["replay_tag"] not in known]
+        print(f"    {tag}: {len(rows)} battles, {len(todo)} new", flush=True)
+        if todo:
+            pipeline.replays(client, todo, sink=sink, on_error=lambda b, e: None)
+
+    pipeline.battles(
         client, players, found_on={}, seed="", max_pages=40,
         keep_deck=lambda deck: wanted(parse.base_cards(deck or ""), allow, block),
-        on_error=lambda *a: None)
-
-    keep = [b for b in rows if b.get("replay_tag")]
-    tag_list = [b["replay_tag"] for b in keep]
-    known = set()
-    for i in range(0, len(tag_list), 2000):
-        known |= set(post(server, token, "/known",
-                          {"tags": tag_list[i:i + 2000], "worker": name})["known"])
-    todo = [b for b in keep if b["replay_tag"] not in known]
-    print(f"  {len(rows)} battles found, {len(todo)} not yet collected", flush=True)
-
-    sink = CoordinatorSink(server, token, name, {"rating": None})
-    pipeline.replays(client, todo, sink=sink, on_error=lambda b, e: None)
+        on_done=player_finished, on_error=lambda *a: None)
     sink.flush()
 
     # Close every player in the group; the crawl walked all of their archives.
@@ -283,7 +290,7 @@ def main():
             except Exception:                                  # noqa: BLE001
                 pass
             units = post(args.server, args.token, "/claim",
-                         {"worker": name, "n": 8})["units"]
+                         {"worker": name, "n": 1})["units"]
             if not units:
                 print("  no work available; checking again in 60s", flush=True)
                 time.sleep(60)
