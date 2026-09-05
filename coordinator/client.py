@@ -153,14 +153,16 @@ def do_unit(client, server, token, unit, cfg, name):
     out = []
     for b in todo:
         try:
-            battle, plays = pipeline.fetch_replay(client, b)
+            stats, plays = pipeline.fetch_replay(client, b)
         except Exception as exc:                               # noqa: BLE001
             print(f"    {b['replay_tag']}: {type(exc).__name__}", flush=True)
             continue
-        battle = dict(battle)
-        battle["plays"] = plays
+        # The listing row carries the decks, crowns and result; the replay carries the
+        # timeline and elixir stats. The converter needs BOTH, and scrape.py merges them
+        # the same way - keeping only the replay half silently drops team_deck and the
+        # crowns, which makes the battle unconvertible.
+        battle = {**b, **stats, "plays": plays}
         battle["cards"] = sorted(parse.base_cards(b.get("team_deck", "")))
-        battle["battle_type"] = b.get("battle_type", "")
         out.append(battle)
 
     res = post(server, token, "/submit",
