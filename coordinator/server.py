@@ -23,7 +23,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-LEASE_SECONDS = 900          # a volunteer that goes quiet for 15 minutes loses its unit
+LEASE_SECONDS = 900
+IDLE_GAP = 600           # a gap over this is treated as "the machine was off", not working          # a volunteer that goes quiet for 15 minutes loses its unit
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS unit (
@@ -71,7 +72,11 @@ CREATE TABLE IF NOT EXISTS worker (
   first_seen  REAL,
   last_seen   REAL,
   submitted   INTEGER NOT NULL DEFAULT 0,
-  rejected    INTEGER NOT NULL DEFAULT 0
+  rejected    INTEGER NOT NULL DEFAULT 0,
+  -- Time actually spent working, not wall-clock since first contact. A volunteer who runs
+  -- an hour a night for a week would otherwise look a hundred times slower than they are.
+  active_secs REAL NOT NULL DEFAULT 0,
+  units_done  INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -89,6 +94,11 @@ class Store:
         have = {r[1] for r in self.db.execute("PRAGMA table_info(unit)")}
         if "rating" not in have:
             self.db.execute("ALTER TABLE unit ADD COLUMN rating INTEGER")
+        havew = {r[1] for r in self.db.execute("PRAGMA table_info(worker)")}
+        for col, decl in (("active_secs", "REAL NOT NULL DEFAULT 0"),
+                          ("units_done", "INTEGER NOT NULL DEFAULT 0")):
+            if col not in havew:
+                self.db.execute(f"ALTER TABLE worker ADD COLUMN {col} {decl}")
         self.db.commit()
 
     def add_units(self, kind, targets, ratings=None):
@@ -222,9 +232,9 @@ class Store:
                     continue
                 if self.wanted(b) is not None:
                     filtered += 1
-                    self.db.execute(
-                        "INSERT OR IGNORE INTO seen(replay_tag, worker, at) VALUES (?,?,?)",
-                        (tag, worker, now))          # remember it so nobody refetches it
+                    # Deliberately NOT marked as seen. Marking filtered battles saves a
+                    # refetch, but it also means a wrong or later-relaxed filter loses them
+                    # permanently - which is exactly what a rating bug did here once.
                     continue
                 self.db.execute(
                     "INSERT OR IGNORE INTO seen(replay_tag, worker, at) VALUES (?,?,?)",
@@ -235,11 +245,39 @@ class Store:
                 kept += 1
             if unit_id is not None:
                 self.db.execute("UPDATE unit SET state='done' WHERE id=?", (unit_id,))
+                self.db.execute(
+                    "UPDATE worker SET units_done=units_done+1 WHERE name=?", (worker,))
+            # A gap longer than IDLE_GAP means the machine was off or asleep; anything
+            # shorter counts as time spent collecting.
+            prev = self.db.execute("SELECT last_seen FROM worker WHERE name=?",
+                                   (worker,)).fetchone()
+            gap = now - prev[0] if prev and prev[0] else 0.0
+            add = gap if 0 < gap <= IDLE_GAP else 0.0
             self.db.execute(
-                "UPDATE worker SET submitted=submitted+?, last_seen=? WHERE name=?",
-                (kept, now, worker))
+                "UPDATE worker SET submitted=submitted+?, last_seen=?, "
+                "active_secs=active_secs+? WHERE name=?", (kept, now, add, worker))
             self.db.commit()
         return {"kept": kept, "duplicate": dup, "filtered": filtered}
+
+    def workers(self):
+        """Per-device totals and rate, so the operator can see who is collecting what."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT name, submitted, units_done, active_secs, first_seen, last_seen "
+                "FROM worker ORDER BY submitted DESC").fetchall()
+        out = []
+        for name, sub, units, active, first, last in rows:
+            hours = (active or 0) / 3600.0
+            out.append({
+                "device": name,
+                "battles": sub,
+                "players_done": units,
+                "active_hours": round(hours, 2),
+                "battles_per_hour": round(sub / hours, 1) if hours > 0.01 else None,
+                "first_seen": first,
+                "last_seen": last,
+            })
+        return out
 
     def stats(self):
         with self.lock:
@@ -284,6 +322,8 @@ def make_handler(store, token):
         def do_GET(self):
             if self.path == "/stats":
                 return self._send(200, store.stats())
+            if self.path == "/workers":
+                return self._send(200, {"workers": store.workers()})
             if self.path == "/config":
                 # Clients fetch this before working, so the operator's card rules are applied
                 # BEFORE a replay is fetched rather than after it is submitted. Changing the
@@ -312,6 +352,30 @@ def make_handler(store, token):
             if self.path == "/known":
                 tags = [t for t in (body.get("tags") or []) if isinstance(t, str)][:5000]
                 return self._send(200, {"known": sorted(store.known(tags))})
+
+            if self.path == "/queue":
+                # Operator-only in practice: it needs the token, same as everything else.
+                rows = body.get("players") or []
+                if not isinstance(rows, list) or len(rows) > 20000:
+                    return self._send(400, {"error": "players must be a list under 20000"})
+                tags, ratings = [], {}
+                for r in rows:
+                    t = (r or {}).get("tag") if isinstance(r, dict) else r
+                    if not isinstance(t, str) or not t:
+                        continue
+                    t = t.lstrip("#").upper()
+                    tags.append(t)
+                    if isinstance(r, dict) and r.get("rating") is not None:
+                        try:
+                            ratings[t] = int(r["rating"])
+                        except (TypeError, ValueError):
+                            pass
+                before = store.stats()["units_open"] + store.stats()["units_done"] \
+                    + store.stats()["units_leased"]
+                store.add_units("player", tags, ratings)
+                after = store.stats()["units_open"] + store.stats()["units_done"] \
+                    + store.stats()["units_leased"]
+                return self._send(200, {"added": after - before, "seen_in_request": len(tags)})
 
             if self.path == "/submit":
                 battles = body.get("battles") or []
@@ -342,6 +406,8 @@ def main():
     ap.add_argument("--battle-types", default="",
                     help="comma-separated battle_type values to keep; empty keeps all")
     ap.add_argument("--show", action="store_true", help="print the current filters and exit")
+    ap.add_argument("--rates", action="store_true",
+                    help="print per-device collection rates and exit")
     args = ap.parse_args()
 
     store = Store(args.db)
@@ -366,6 +432,26 @@ def main():
         if val:
             store.set_setting(key, val)
             print(f"{key}: {val}")
+
+    if args.rates:
+        import datetime as _d
+        rows = store.workers()
+        if not rows:
+            print("no devices have collected anything yet")
+            return
+        print(f"{'device':32s} {'battles':>8s} {'players':>8s} {'hours':>7s} {'per hour':>9s}"
+              f"  last seen")
+        for w in rows:
+            seen = _d.datetime.fromtimestamp(w["last_seen"]).strftime("%m-%d %H:%M") \
+                if w["last_seen"] else "-"
+            rate = f"{w['battles_per_hour']:.0f}" if w["battles_per_hour"] else "-"
+            print(f"{w['device'][:32]:32s} {w['battles']:8d} {w['players_done']:8d} "
+                  f"{w['active_hours']:7.2f} {rate:>9s}  {seen}")
+        tot = sum(w["battles"] for w in rows)
+        hrs = sum(w["active_hours"] for w in rows)
+        print(f"\n{tot} battles from {len(rows)} devices over {hrs:.1f} device-hours"
+              + (f" - {tot/hrs:.0f}/hour combined" if hrs > 0.01 else ""))
+        return
 
     if args.show:
         st = dict(store.settings())

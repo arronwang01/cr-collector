@@ -230,9 +230,13 @@ def do_group(client, server, token, units, cfg, name):
     # only RETURNS once the whole group is exhausted - 8 players x 40 pages is ~23 minutes of
     # silence before a single replay is fetched. on_done fires as each player finishes, so
     # their replays are fetched then: same overlap, progress every minute or two instead.
+    # The sink was built with {"rating": None}, so no battle ever carried a rating, the
+    # server read it as 0, and a min_rating filter silently rejected everything. The rating
+    # belongs to the player whose history the battle came from, so it is set per player.
     sink = CoordinatorSink(server, token, name, {"rating": None})
 
     def player_finished(tag, kept):
+        sink.unit = by_tag.get(tag) or {"rating": None}
         rows = [b for b in kept if b.get("replay_tag")]
         if not rows:
             return
