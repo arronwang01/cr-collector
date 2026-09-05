@@ -154,58 +154,65 @@ def ensure_login(client, pages):
     return False
 
 
+class CoordinatorSink:
+    """Collects battles from pipeline.replays and posts them in batches.
+
+    pipeline.replays fetches a slice of 24 replays in parallel, which is what makes the
+    original scraper roughly four times faster than fetching them one at a time. Reusing it
+    rather than reimplementing the loop keeps that speed and its retry behaviour.
+    """
+
+    def __init__(self, server, token, name, unit, batch=25):
+        self.server, self.token, self.name = server, token, name
+        self.unit, self.batch = unit, batch
+        self.buf, self.kept = [], 0
+
+    def write(self, b, stats, plays):
+        from royale import parse
+        battle = {**b, **stats, "plays": plays}
+        battle["cards"] = sorted(parse.base_cards(b.get("team_deck", "")))
+        if self.unit.get("rating") is not None:
+            battle["rating"] = self.unit["rating"]
+        self.buf.append(battle)
+        if len(self.buf) >= self.batch:
+            self.flush()
+        return True
+
+    def flush(self, unit_id=None):
+        if not self.buf and unit_id is None:
+            return
+        res = post(self.server, self.token, "/submit",
+                   {"worker": self.name, "unit_id": unit_id, "battles": self.buf})
+        self.kept += res["kept"]
+        if self.buf:
+            print(f"    sent {len(self.buf)}: kept {res['kept']}, dup {res['duplicate']}, "
+                  f"filtered {res['filtered']}", flush=True)
+        self.buf = []
+
+
 def do_unit(client, server, token, unit, cfg, name):
     """One player's history: list battles, drop what is unwanted or already collected,
-    fetch the replay timelines for the rest, hand them back."""
+    fetch the replay timelines for the rest in parallel, hand them back."""
     tag = unit["target"].lstrip("#")
     allow, block = cfg.get("allow") or [], cfg.get("block") or []
 
-    rows = pipeline.player_battles(client, tag)
     from royale import parse
+    rows = pipeline.player_battles(client, tag)
     keep = [b for b in rows
             if b.get("replay_tag") and wanted(parse.base_cards(b.get("team_deck", "")),
                                               allow, block)]
-
     tags = [b["replay_tag"] for b in keep]
     known = set(post(server, token, "/known", {"tags": tags, "worker": name})["known"])
     todo = [b for b in keep if b["replay_tag"] not in known]
     print(f"  {tag}: {len(rows)} battles, {len(keep)} match your rules, "
           f"{len(todo)} not yet collected", flush=True)
 
-    # Sent in batches rather than once at the end: a player with hundreds of battles would
-    # otherwise show nothing for many minutes and lose the lot on a crash.
-    BATCH = 25
-    kept = 0
-    out = []
-    for b in todo:
-        try:
-            stats, plays = pipeline.fetch_replay(client, b)
-        except Exception as exc:                               # noqa: BLE001
-            print(f"    {b['replay_tag']}: {type(exc).__name__}", flush=True)
-            continue
-        # The listing row carries the decks, crowns and result; the replay carries the
-        # timeline and elixir stats. The converter needs BOTH, and scrape.py merges them
-        # the same way - keeping only the replay half silently drops team_deck and the
-        # crowns, which makes the battle unconvertible.
-        battle = {**b, **stats, "plays": plays}
-        battle["cards"] = sorted(parse.base_cards(b.get("team_deck", "")))
-        if unit.get("rating") is not None:      # so the server's rating filter can apply
-            battle["rating"] = unit["rating"]
-        out.append(battle)
-
-        if len(out) >= BATCH:
-            res = post(server, token, "/submit", {"worker": name, "battles": out})
-            kept += res["kept"]
-            print(f"    sent {len(out)}: kept {res['kept']}, dup {res['duplicate']}, "
-                  f"filtered {res['filtered']}", flush=True)
-            out = []
-
-    # The last batch closes the unit, so it is only marked done once everything is in.
-    res = post(server, token, "/submit",
-               {"worker": name, "unit_id": unit["unit_id"], "battles": out})
-    kept += res["kept"]
-    print(f"  {tag} done: {kept} new battles collected", flush=True)
-    return kept
+    sink = CoordinatorSink(server, token, name, unit)
+    pipeline.replays(client, todo, sink=sink,
+                     on_error=lambda b, e: None)     # one dead replay never stops the rest
+    sink.flush(unit_id=unit["unit_id"])              # last batch closes the unit
+    print(f"  {tag} done: {sink.kept} new battles collected", flush=True)
+    return sink.kept
 
 
 def main():
