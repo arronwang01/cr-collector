@@ -1,0 +1,3 @@
+# Ask the admin for the token - it is not public.
+server = http://35.237.250.244:8787
+token = ASK-THE-ADMIN
