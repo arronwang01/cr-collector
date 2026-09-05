@@ -190,28 +190,47 @@ class CoordinatorSink:
         self.buf = []
 
 
-def do_unit(client, server, token, unit, cfg, name):
-    """One player's history: list battles, drop what is unwanted or already collected,
-    fetch the replay timelines for the rest in parallel, hand them back."""
-    tag = unit["target"].lstrip("#")
-    allow, block = cfg.get("allow") or [], cfg.get("block") or []
+def do_group(client, server, token, units, cfg, name):
+    """Crawl a GROUP of players at once, the way the original scraper does.
 
+    One player's history must be walked in order - page N+1's cursor comes from page N - so
+    crawling a single player leaves every request waiting on the last. pipeline.battles
+    advances every player by one page per round and fetches the round as one batch, which is
+    what makes the original roughly three times faster. Doing one player at a time was the
+    whole speed gap.
+    """
     from royale import parse
-    rows = pipeline.player_battles(client, tag)
-    keep = [b for b in rows
-            if b.get("replay_tag") and wanted(parse.base_cards(b.get("team_deck", "")),
-                                              allow, block)]
-    tags = [b["replay_tag"] for b in keep]
-    known = set(post(server, token, "/known", {"tags": tags, "worker": name})["known"])
-    todo = [b for b in keep if b["replay_tag"] not in known]
-    print(f"  {tag}: {len(rows)} battles, {len(keep)} match your rules, "
-          f"{len(todo)} not yet collected", flush=True)
+    allow, block = cfg.get("allow") or [], cfg.get("block") or []
+    tags = [u["target"].lstrip("#") for u in units]
+    by_tag = {u["target"].lstrip("#"): u for u in units}
+    players = {t: {"player_tag": t} for t in tags}
 
-    sink = CoordinatorSink(server, token, name, unit)
-    pipeline.replays(client, todo, sink=sink,
-                     on_error=lambda b, e: None)     # one dead replay never stops the rest
-    sink.flush(unit_id=unit["unit_id"])              # last batch closes the unit
-    print(f"  {tag} done: {sink.kept} new battles collected", flush=True)
+    print(f"  crawling {len(tags)} players together: {', '.join(tags[:6])}"
+          f"{'...' if len(tags) > 6 else ''}", flush=True)
+
+    rows, _, _ = pipeline.battles(
+        client, players, found_on={}, seed="",
+        keep_deck=lambda deck: wanted(parse.base_cards(deck or ""), allow, block),
+        on_error=lambda *a: None)
+
+    keep = [b for b in rows if b.get("replay_tag")]
+    tag_list = [b["replay_tag"] for b in keep]
+    known = set()
+    for i in range(0, len(tag_list), 2000):
+        known |= set(post(server, token, "/known",
+                          {"tags": tag_list[i:i + 2000], "worker": name})["known"])
+    todo = [b for b in keep if b["replay_tag"] not in known]
+    print(f"  {len(rows)} battles found, {len(todo)} not yet collected", flush=True)
+
+    sink = CoordinatorSink(server, token, name, {"rating": None})
+    pipeline.replays(client, todo, sink=sink, on_error=lambda b, e: None)
+    sink.flush()
+
+    # Close every player in the group; the crawl walked all of their archives.
+    for u in units:
+        post(server, token, "/submit",
+             {"worker": name, "unit_id": u["unit_id"], "battles": []})
+    print(f"  group done: {sink.kept} new battles\n", flush=True)
     return sink.kept
 
 
@@ -245,21 +264,20 @@ def main():
             except Exception:                                  # noqa: BLE001
                 pass
             units = post(args.server, args.token, "/claim",
-                         {"worker": name, "n": 1})["units"]
+                         {"worker": name, "n": 8})["units"]
             if not units:
                 print("  no work available; checking again in 60s", flush=True)
                 time.sleep(60)
                 continue
-            for u in units:
-                try:
-                    total += do_unit(client, args.server, args.token, u, cfg, name)
-                except KeyboardInterrupt:
-                    raise
-                except Exception as exc:                       # noqa: BLE001
-                    print(f"  unit failed ({type(exc).__name__}: {exc}); "
-                          f"it returns to the queue automatically", flush=True)
-                state["collected"] = total
-                save_state(state)
+            try:
+                total += do_group(client, args.server, args.token, units, cfg, name)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:                           # noqa: BLE001
+                print(f"  group failed ({type(exc).__name__}: {exc}); "
+                      f"those players return to the queue automatically", flush=True)
+            state["collected"] = total
+            save_state(state)
             print(f"  total collected by you: {total}\n", flush=True)
     except KeyboardInterrupt:
         print("\n  stopped. run it again any time - it picks up where it left off.")
