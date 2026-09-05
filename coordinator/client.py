@@ -33,6 +33,9 @@ HOME = Path.home() / ".cr-scraper"
 PROFILE = HOME / "browser"
 STATE = HOME / "state.json"
 
+# A well-known active player, used only to prove the login works by fetching one replay.
+PROBE_PLAYER = "C2J2V29GJ"
+
 
 class OwnProfilePages(Pages):
     """Pages, but backed by a persistent profile this program owns.
@@ -113,39 +116,16 @@ def wanted(cards, allow, block):
 
 
 def ensure_login(client, pages):
-    """Block until the volunteer is really signed in, without disturbing the login page.
+    """Open the login page and wait until a real replay fetch succeeds.
 
-    Three approaches were needed to get this right, so the reasoning is worth keeping:
+    Every attempt to *detect* login was wrong in a different way: navigating to /me threw
+    away what the person was typing, the session cookie is set for anonymous visitors too,
+    and Cloudflare 403s the request API whether signed in or not.
 
-      * client.logged_in() navigates the visible page to /me, which threw away whatever the
-        person was halfway through typing.
-      * The session cookie is useless as a signal - RoyaleAPI sets __royaleapi_session_v2
-        for anonymous visitors, so it reported success before anyone had logged in.
-      * The context's request API is blocked by Cloudflare with a flat 403 whether logged in
-        or not, because it carries no browser fingerprint.
-
-    So the check opens a SECOND page, which has the real browser fingerprint and passes
-    Cloudflare, and closes it again. /me stays on /me when signed in and redirects to /login
-    when not. The page the volunteer is typing into is never touched.
+    So this does not detect anything. It tries the actual work - fetching one replay, which
+    is the only login-gated call - and treats success as proof. A test that IS the work
+    cannot report a state the work does not have.
     """
-    def signed_in():
-        page = None
-        try:
-            page = pages._ctx.new_page()
-            page.goto("https://royaleapi.com/me", wait_until="domcontentloaded",
-                      timeout=45_000)
-            return "/login" not in page.url
-        except Exception:                                      # noqa: BLE001
-            return False
-        finally:
-            if page is not None:
-                try:
-                    page.close()
-                except Exception:                              # noqa: BLE001
-                    pass
-
-    if signed_in():
-        return True
     try:
         pages.auth.goto("https://royaleapi.com/login", wait_until="domcontentloaded",
                         timeout=60_000)
@@ -155,15 +135,22 @@ def ensure_login(client, pages):
     print("  Take as long as you need - nothing here will interrupt you.")
     print("  This program never sees your password; you are typing it into RoyaleAPI.\n",
           flush=True)
+
     waited = 0
     while waited < 3600:
-        time.sleep(15)          # a real page load each time, so not too eagerly
+        time.sleep(15)
         waited += 15
-        if signed_in():
+        try:
+            rows = pipeline.player_battles(client, PROBE_PLAYER, max_pages=1)
+            rows = [r for r in rows if r.get("replay_tag")]
+            if not rows:
+                continue                      # nothing to test with; try again shortly
+            pipeline.fetch_replay(client, rows[0])
             print("  logged in, thanks. working.\n", flush=True)
             return True
-        if waited % 60 == 0:
-            print(f"  still waiting for login ({waited // 60} min)", flush=True)
+        except Exception:                                      # noqa: BLE001
+            if waited % 60 == 0:
+                print(f"  still waiting for login ({waited // 60} min)", flush=True)
     return False
 
 
