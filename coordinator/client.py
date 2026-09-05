@@ -163,6 +163,8 @@ def do_unit(client, server, token, unit, cfg, name):
         # crowns, which makes the battle unconvertible.
         battle = {**b, **stats, "plays": plays}
         battle["cards"] = sorted(parse.base_cards(b.get("team_deck", "")))
+        if unit.get("rating") is not None:      # so the server's rating filter can apply
+            battle["rating"] = unit["rating"]
         out.append(battle)
 
     res = post(server, token, "/submit",

@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS unit (
   id          INTEGER PRIMARY KEY,
   kind        TEXT NOT NULL,              -- 'player' or 'deck'
   target      TEXT NOT NULL,              -- player tag, or deck signature
+  rating      INTEGER,                    -- known rating, so rating filters work per player
   state       TEXT NOT NULL DEFAULT 'open',   -- open | leased | done
   leased_by   TEXT,
   leased_at   REAL,
@@ -58,6 +59,13 @@ CREATE TABLE IF NOT EXISTS deck_rule (
   rule        TEXT NOT NULL               -- 'allow' or 'block'
 );
 
+-- Operator knobs, adjustable while everything is running. Clients read them at the start
+-- of every unit, so a change reaches every volunteer within a minute or two.
+CREATE TABLE IF NOT EXISTS setting (
+  key         TEXT PRIMARY KEY,
+  value       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS worker (
   name        TEXT PRIMARY KEY,
   first_seen  REAL,
@@ -75,15 +83,36 @@ class Store:
         self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.executescript(SCHEMA)
+        # CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a database made by
+        # an older build keeps its old columns. Add anything missing rather than making the
+        # operator rebuild and lose the dedup ledger.
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(unit)")}
+        if "rating" not in have:
+            self.db.execute("ALTER TABLE unit ADD COLUMN rating INTEGER")
         self.db.commit()
 
-    def add_units(self, kind, targets):
+    def add_units(self, kind, targets, ratings=None):
+        ratings = ratings or {}
         with self.lock:
             self.db.executemany(
-                "INSERT OR IGNORE INTO unit(kind, target) VALUES (?, ?)",
-                [(kind, t) for t in targets])
+                "INSERT OR IGNORE INTO unit(kind, target, rating) VALUES (?, ?, ?)",
+                [(kind, t, ratings.get(t)) for t in targets])
             self.db.commit()
             return self.db.total_changes
+
+    def settings(self):
+        with self.lock:
+            rows = self.db.execute("SELECT key, value FROM setting").fetchall()
+        return {k: v for k, v in rows}
+
+    def set_setting(self, key, value):
+        with self.lock:
+            if value in ("", None):
+                self.db.execute("DELETE FROM setting WHERE key=?", (key,))
+            else:
+                self.db.execute("INSERT OR REPLACE INTO setting(key,value) VALUES (?,?)",
+                                (key, str(value)))
+            self.db.commit()
 
     def claim(self, worker, n=1):
         """Hand out open units, reclaiming any whose lease has expired."""
@@ -92,12 +121,19 @@ class Store:
             self.db.execute(
                 "UPDATE unit SET state='open', leased_by=NULL "
                 "WHERE state='leased' AND leased_at < ?", (cutoff,))
-            rows = self.db.execute(
-                "SELECT id, kind, target FROM unit "
-                "WHERE state='open' AND attempts < 5 ORDER BY attempts, id LIMIT ?",
-                (n,)).fetchall()
+            minr = self.settings().get("min_rating")
+            if minr:
+                rows = self.db.execute(
+                    "SELECT id, kind, target, rating FROM unit WHERE state='open' "
+                    "AND attempts < 5 AND (rating IS NULL OR rating >= ?) "
+                    "ORDER BY attempts, id LIMIT ?", (int(minr), n)).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT id, kind, target, rating FROM unit "
+                    "WHERE state='open' AND attempts < 5 ORDER BY attempts, id LIMIT ?",
+                    (n,)).fetchall()
             now = time.time()
-            for uid, _, _ in rows:
+            for uid, _, _, _ in rows:
                 self.db.execute(
                     "UPDATE unit SET state='leased', leased_by=?, leased_at=?, "
                     "attempts=attempts+1 WHERE id=?", (worker, now, uid))
@@ -106,7 +142,8 @@ class Store:
                 "ON CONFLICT(name) DO UPDATE SET last_seen=excluded.last_seen",
                 (worker, now, now))
             self.db.commit()
-        return [{"unit_id": r[0], "kind": r[1], "target": r[2]} for r in rows]
+        return [{"unit_id": r[0], "kind": r[1], "target": r[2], "rating": r[3]}
+                for r in rows]
 
     def known(self, tags):
         """Which of these replay tags have already been collected."""
@@ -126,13 +163,50 @@ class Store:
         block = {c for c, r in rows if r == "block"}
         return allow, block
 
-    def wanted(self, cards):
-        """Operator's filter. Empty allow list means everything that is not blocked."""
+    def wanted(self, battle):
+        """Every operator filter, in one place. Returns None to keep, or a reason to drop.
+
+        `submit` is the authority - a client that ignores the rules, or is running an old
+        copy of them, still cannot put unwanted battles in the dataset.
+        """
+        st = self.settings()
         allow, block = self.deck_rules()
-        cards = set(cards or ())
+
+        cards = set(battle.get("cards") or ())
         if cards & block:
-            return False
-        return not allow or bool(cards & allow)
+            return "blocked card"
+        if allow and not (cards & allow):
+            return "no allowed card"
+
+        since = st.get("since_timestamp")
+        if since:
+            try:
+                if int(battle.get("battle_timestamp") or 0) < int(since):
+                    return "too old"
+            except (TypeError, ValueError):
+                pass
+
+        minr = st.get("min_rating")
+        if minr:
+            try:
+                if int(battle.get("rating") or 0) < int(minr):
+                    return "rating too low"
+            except (TypeError, ValueError):
+                pass
+
+        minp = st.get("min_plays")
+        if minp:
+            # Top-ladder matches where nobody deploys teach nothing and waste a conversion
+            # slot, so they are dropped here rather than discovered by the engine later.
+            if len(battle.get("plays") or ()) < int(minp):
+                return "too few plays"
+
+        types = st.get("battle_types")
+        if types:
+            ok = {t.strip() for t in types.split(",") if t.strip()}
+            if (battle.get("battle_type") or "") not in ok:
+                return "wrong battle type"
+        return None
 
     def submit(self, worker, unit_id, battles):
         kept = dup = filtered = 0
@@ -146,7 +220,7 @@ class Store:
                                    (tag,)).fetchone():
                     dup += 1
                     continue
-                if not self.wanted(b.get("cards")):
+                if self.wanted(b) is not None:
                     filtered += 1
                     self.db.execute(
                         "INSERT OR IGNORE INTO seen(replay_tag, worker, at) VALUES (?,?,?)",
@@ -215,7 +289,10 @@ def make_handler(store, token):
                 # BEFORE a replay is fetched rather than after it is submitted. Changing the
                 # rules here changes what every volunteer collects, with nothing to reinstall.
                 allow, block = store.deck_rules()
-                return self._send(200, {"allow": sorted(allow), "block": sorted(block)})
+                cfg = dict(store.settings())
+                cfg["allow"] = sorted(allow)
+                cfg["block"] = sorted(block)
+                return self._send(200, cfg)
             self._send(404, {"error": "not found"})
 
         def do_POST(self):
@@ -257,6 +334,14 @@ def main():
     ap.add_argument("--allow", default="", help="comma-separated cards to collect")
     ap.add_argument("--block", default="", help="comma-separated cards to never collect")
     ap.add_argument("--stats", action="store_true", help="print stats and exit")
+    ap.add_argument("--since", default="", help="only battles on/after this date, YYYY-MM-DD")
+    ap.add_argument("--min-rating", default="", help="skip players below this rating")
+    ap.add_argument("--min-plays", default="",
+                    help="drop battles with fewer card plays than this - use 4 or so to "
+                         "throw away the empty top-ladder matches where nobody deploys")
+    ap.add_argument("--battle-types", default="",
+                    help="comma-separated battle_type values to keep; empty keeps all")
+    ap.add_argument("--show", action="store_true", help="print the current filters and exit")
     args = ap.parse_args()
 
     store = Store(args.db)
@@ -270,6 +355,28 @@ def main():
                     [(c, rule) for c in cards])
                 store.db.commit()
             print(f"{rule}: {', '.join(cards)}")
+
+    import datetime as _dt
+    if args.since:
+        ts = int(_dt.datetime.strptime(args.since, "%Y-%m-%d").timestamp())
+        store.set_setting("since_timestamp", ts)
+        print(f"since: {args.since} ({ts})")
+    for key, val in (("min_rating", args.min_rating), ("min_plays", args.min_plays),
+                     ("battle_types", args.battle_types)):
+        if val:
+            store.set_setting(key, val)
+            print(f"{key}: {val}")
+
+    if args.show:
+        st = dict(store.settings())
+        a, b = store.deck_rules()
+        if "since_timestamp" in st:
+            st["since_readable"] = _dt.datetime.fromtimestamp(
+                int(st["since_timestamp"])).strftime("%Y-%m-%d")
+        st["allow"] = sorted(a) or "(everything)"
+        st["block"] = sorted(b) or "(nothing)"
+        print(json.dumps(st, indent=1))
+        return
 
     if args.add_players:
         tags = [t.strip() for t in open(args.add_players) if t.strip()]

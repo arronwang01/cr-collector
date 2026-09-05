@@ -23,10 +23,21 @@ fi
 CFG="coordinator/settings.txt"
 SERVER=$(grep -E "^server" "$CFG" | cut -d= -f2- | tr -d " ")
 TOKEN=$(grep -E "^token"  "$CFG" | cut -d= -f2- | tr -d " ")
-if [ -z "$SERVER" ] || [ "$TOKEN" = "CHANGE-ME" ]; then
-  echo "coordinator/settings.txt has not been filled in. Ask whoever sent you this folder."
-  read -n 1 -s -r -p "Press any key to close."
-  exit 1
+# Ask for the access code rather than making anyone edit a config file, and remember it.
+if [ -z "$TOKEN" ] || [ "$TOKEN" = "CHANGE-ME" ] || [ "$TOKEN" = "ASK-THE-ADMIN" ]; then
+  echo "You need the access code from whoever invited you."
+  echo "It looks like:  cr-1234abcd..."
+  echo
+  read -r -p "Paste the access code and press Enter: " TOKEN
+  TOKEN=$(echo "$TOKEN" | tr -d " \t\r\n")
+  if [ -z "$TOKEN" ]; then
+    echo "No code entered. Ask the admin for it, then run this again."
+    read -n 1 -s -r -p "Press any key to close."
+    exit 1
+  fi
+  printf "server = %s\ntoken = %s\n" "$SERVER" "$TOKEN" > "$CFG"
+  echo "Saved. You will not be asked again."
+  echo
 fi
 
 echo

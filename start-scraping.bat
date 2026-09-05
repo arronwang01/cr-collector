@@ -33,8 +33,27 @@ for /f "usebackq tokens=1,* delims== " %%a in ("coordinator\settings.txt") do (
   if "%%a"=="server" set SERVER=%%b
   if "%%a"=="token"  set TOKEN=%%b
 )
-if "%TOKEN%"=="CHANGE-ME" goto notset
-if "%TOKEN%"=="" goto notset
+if "%TOKEN%"=="CHANGE-ME" goto askcode
+if "%TOKEN%"=="ASK-THE-ADMIN" goto askcode
+if "%TOKEN%"=="" goto askcode
+goto havecode
+
+:askcode
+echo You need the access code from whoever invited you.
+echo It looks like:  cr-1234abcd...
+echo.
+set /p TOKEN=Paste the access code and press Enter: 
+if "%TOKEN%"=="" (
+  echo No code entered. Ask the admin for it, then run this again.
+  pause
+  exit /b 1
+)
+> "coordinator\settings.txt" echo server = %SERVER%
+>>"coordinator\settings.txt" echo token = %TOKEN%
+echo Saved. You will not be asked again.
+echo.
+
+:havecode
 
 echo.
 echo A browser window will open. Log in to RoyaleAPI there.
@@ -49,12 +68,6 @@ echo Stopped unexpectedly. Restarting in 15s - your progress is saved.
 echo Close this window if you want to stop for good.
 timeout /t 15 /nobreak >nul
 goto loop
-
-:notset
-echo coordinator\settings.txt has not been filled in.
-echo Ask whoever sent you this folder for the server address and token.
-pause
-exit /b 1
 
 :done
 echo All done.
