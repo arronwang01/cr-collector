@@ -54,11 +54,26 @@ class OwnProfilePages(Pages):
         ctx = self._pw.chromium.launch_persistent_context(
             str(PROFILE), headless=False,
             args=["--disable-blink-features=AutomationControlled"])
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
         self._ctx = ctx
-        self._solve(page, ctx)
-        self.anon = page
-        self.auth = page                 # one logged-in profile serves both
+        # Two pages, one profile. The base class keeps anon and auth apart because a 403 on
+        # one triggers renew() - which re-solves the Cloudflare challenge on that page - and
+        # sharing a single page made the two fight each other, so the challenge never
+        # cleared. Same context means both still share the one login.
+        anon = ctx.pages[0] if ctx.pages else ctx.new_page()
+        self._route(anon)
+        self._solve(anon, ctx)
+        auth = ctx.new_page()
+        self._route(auth)
+        self._solve(auth, ctx)
+        self.anon = anon
+        self.auth = auth
+
+    @staticmethod
+    def _route(page):
+        """Drop the assets the base class drops; only documents matter here."""
+        from royale.transport import SKIP
+        page.route("**/*", lambda r: r.abort() if r.request.resource_type in SKIP
+                   else r.continue_())
 
     def close(self):
         try:
