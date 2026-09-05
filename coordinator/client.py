@@ -223,8 +223,12 @@ def do_group(client, server, token, units, cfg, name):
     print(f"  crawling {len(tags)} players together: {', '.join(tags[:6])}"
           f"{'...' if len(tags) > 6 else ''}", flush=True)
 
+    # max_pages matters more than it looks. The default of 0 walks a player's ENTIRE
+    # archive, and battles() returns nothing until every player in the group is exhausted -
+    # so one deep-history player stalls the whole group for many minutes before a single
+    # replay is fetched. The original scraper caps at 40 pages for exactly this reason.
     rows, _, _ = pipeline.battles(
-        client, players, found_on={}, seed="",
+        client, players, found_on={}, seed="", max_pages=40,
         keep_deck=lambda deck: wanted(parse.base_cards(deck or ""), allow, block),
         on_error=lambda *a: None)
 
