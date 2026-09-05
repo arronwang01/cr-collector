@@ -113,18 +113,21 @@ def wanted(cards, allow, block):
 
 
 def ensure_login(client, pages):
-    """Block until the volunteer is signed in, in our own window.
+    """Block until the volunteer is really signed in, without disturbing the login page.
 
-    Checks the profile's cookie jar rather than loading a page. The first version called
-    logged_in(), which navigates to /me - so every check threw away whatever the person was
-    halfway through typing. Reading cookies cannot disturb the page, so it can be checked
-    often without being in the way.
+    Two earlier versions were wrong. Calling logged_in() navigates to /me, which threw away
+    whatever the person was halfway through typing. Looking for the session cookie is
+    non-destructive but useless: RoyaleAPI sets __royaleapi_session_v2 for anonymous
+    visitors too, so it reported success before anyone had logged in.
+
+    This asks /me through the context's request API. It shares the profile's cookies, so
+    the answer is authoritative, and it opens no page, so the login form is left alone.
     """
-    from royale.cookies import SESSION_COOKIE
-
     def signed_in():
         try:
-            return any(c["name"] == SESSION_COOKIE for c in pages._ctx.cookies())
+            r = pages._ctx.request.get("https://royaleapi.com/me",
+                                       max_redirects=0, timeout=30_000)
+            return r.status == 200 and "/login" not in r.url
         except Exception:                                      # noqa: BLE001
             return False
 
@@ -140,10 +143,11 @@ def ensure_login(client, pages):
     print("  This program never sees your password; you are typing it into RoyaleAPI.\n",
           flush=True)
     waited = 0
-    while waited < 3600:                       # an hour is plenty; then it gives up cleanly
+    while waited < 3600:
         time.sleep(5)
         waited += 5
         if signed_in():
+            print("  logged in, thanks.\n", flush=True)
             return True
         if waited % 60 == 0:
             print(f"  still waiting for login ({waited // 60} min)", flush=True)
