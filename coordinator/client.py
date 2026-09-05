@@ -113,22 +113,40 @@ def wanted(cards, allow, block):
 
 
 def ensure_login(client, pages):
-    """Block until the volunteer is signed in, in our own window."""
-    for _ in range(120):
+    """Block until the volunteer is signed in, in our own window.
+
+    Checks the profile's cookie jar rather than loading a page. The first version called
+    logged_in(), which navigates to /me - so every check threw away whatever the person was
+    halfway through typing. Reading cookies cannot disturb the page, so it can be checked
+    often without being in the way.
+    """
+    from royale.cookies import SESSION_COOKIE
+
+    def signed_in():
         try:
-            if client.logged_in():
-                return True
+            return any(c["name"] == SESSION_COOKIE for c in pages._ctx.cookies())
         except Exception:                                      # noqa: BLE001
-            pass
-        print("\n  Please log in to RoyaleAPI in the browser window that just opened.")
-        print("  This program never sees your password - you are typing it into RoyaleAPI.")
-        print("  Waiting... (checking every 10s)\n", flush=True)
-        try:
-            pages.auth.goto("https://royaleapi.com/login", wait_until="domcontentloaded",
-                            timeout=60_000)
-        except Exception:                                      # noqa: BLE001
-            pass
-        time.sleep(10)
+            return False
+
+    if signed_in():
+        return True
+    try:
+        pages.auth.goto("https://royaleapi.com/login", wait_until="domcontentloaded",
+                        timeout=60_000)
+    except Exception:                                          # noqa: BLE001
+        pass
+    print("\n  Log in to RoyaleAPI in the browser window that opened.")
+    print("  Take as long as you need - nothing here will interrupt you.")
+    print("  This program never sees your password; you are typing it into RoyaleAPI.\n",
+          flush=True)
+    waited = 0
+    while waited < 3600:                       # an hour is plenty; then it gives up cleanly
+        time.sleep(5)
+        waited += 5
+        if signed_in():
+            return True
+        if waited % 60 == 0:
+            print(f"  still waiting for login ({waited // 60} min)", flush=True)
     return False
 
 
@@ -150,6 +168,10 @@ def do_unit(client, server, token, unit, cfg, name):
     print(f"  {tag}: {len(rows)} battles, {len(keep)} match your rules, "
           f"{len(todo)} not yet collected", flush=True)
 
+    # Sent in batches rather than once at the end: a player with hundreds of battles would
+    # otherwise show nothing for many minutes and lose the lot on a crash.
+    BATCH = 25
+    kept = 0
     out = []
     for b in todo:
         try:
@@ -167,11 +189,19 @@ def do_unit(client, server, token, unit, cfg, name):
             battle["rating"] = unit["rating"]
         out.append(battle)
 
+        if len(out) >= BATCH:
+            res = post(server, token, "/submit", {"worker": name, "battles": out})
+            kept += res["kept"]
+            print(f"    sent {len(out)}: kept {res['kept']}, dup {res['duplicate']}, "
+                  f"filtered {res['filtered']}", flush=True)
+            out = []
+
+    # The last batch closes the unit, so it is only marked done once everything is in.
     res = post(server, token, "/submit",
                {"worker": name, "unit_id": unit["unit_id"], "battles": out})
-    print(f"  sent {len(out)}: kept {res['kept']}, duplicate {res['duplicate']}, "
-          f"filtered {res['filtered']}", flush=True)
-    return res["kept"]
+    kept += res["kept"]
+    print(f"  {tag} done: {kept} new battles collected", flush=True)
+    return kept
 
 
 def main():
